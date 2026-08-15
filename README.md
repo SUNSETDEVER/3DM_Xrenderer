@@ -141,6 +141,9 @@ void setup() {
 
     xr_render(fb);
 }
+void loop{
+
+}
 ```
 
 ---
