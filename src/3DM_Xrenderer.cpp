@@ -1,6 +1,6 @@
-﻿/**
+/**
  * @file 3DM_Xrenderer.cpp
- * @brief Implementation with backward‑compatible add functions, texture flip, GGX, BVH, tiling.
+ * @brief Implementation of 3DM_Xrenderer library.
  */
 
 #include "3DM_Xrenderer.h"
@@ -8,6 +8,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 /* ---------- Constants ---------- */
 #define EPSILON        1e-2f
@@ -52,29 +53,28 @@ typedef enum {
     OBJ_TABLE,
     OBJ_GLASS_PANEL,
     OBJ_TEXTURED_PLANE,
-    OBJ_SPHERE
+    OBJ_SPHERE,
+    OBJ_TRIANGLE,
+    OBJ_PLANE
 } obj_type_t;
 
 typedef struct {
     obj_type_t type;
     xr_material_t mat;
     xr_vec3_t center;
-    float size;              // half-size for cube, radius for sphere, scale for pyramid
-    xr_vec3_t rot;           // Euler angles (ZYX order) for cube/pyramid
-    // table specifics
+    float size;
+    xr_vec3_t rot;
     float width, depth, height, leg_size;
-    // glass specifics
     xr_vec3_t normal;
     float half_w, half_h, thickness, refr_idx;
-    // textured plane specifics
     xr_vec3_t plane_normal;
     float plane_width, plane_height;
     xr_texture_t texture;
     bool tex_flip_h;
     bool tex_flip_v;
+    xr_vec3_t tri[3];
 } scene_object_t;
 
-/* BVH node */
 typedef struct bvh_node_t {
     xr_vec3_t min;
     xr_vec3_t max;
@@ -84,7 +84,6 @@ typedef struct bvh_node_t {
     int tri_count;
 } bvh_node_t;
 
-/* Mesh structure with BVH */
 typedef struct {
     xr_vec3_t *vertices;
     uint16_t *indices;
@@ -96,6 +95,12 @@ typedef struct {
     int bvh_node_count;
     int bvh_node_capacity;
 } mesh_t;
+
+typedef struct {
+    int *indices;
+    int count;
+    int capacity;
+} lock_group_t;
 
 /* ---------- Global state ---------- */
 static int g_width, g_height;
@@ -113,8 +118,8 @@ static xr_vec3_t g_light_color = {1, 1, 1};
 static bool g_shadow_enabled = false;
 static bool g_microsurface_enabled = false;
 static bool g_bvh_enabled = false;
+static bool g_backface_culling_enabled = true;
 
-/* Scene boundary & wall control */
 static float g_boundary[6] = {-50.0f, 50.0f, -50.0f, 50.0f, -50.0f, 50.0f};
 static bool g_wall_enabled[6] = {true, true, true, true, true, true};
 static xr_material_t g_wall_materials[6] = {
@@ -139,9 +144,11 @@ static mesh_t *g_meshes = NULL;
 static int g_mesh_count = 0;
 static int g_mesh_capacity = 0;
 
-/* Tile buffer provided by user */
 static uint16_t *g_tile_buffer = NULL;
 static int g_tile_buffer_size = 0;
+
+static lock_group_t *g_lock_groups = NULL;
+static int g_lock_group_count = 0;
 
 /* ---------- Vector math ---------- */
 static inline float fast_inv_sqrt(float x) {
@@ -199,8 +206,6 @@ static inline xr_vec3_t apply_transform(xr_vec3_t p, xr_vec3_t pos, xr_vec3_t ro
     p.z += pos.z;
     return p;
 }
-
-/* Inverse Euler rotation (ZYX order) */
 static inline xr_vec3_t apply_inverse_euler(xr_vec3_t p, xr_vec3_t rot) {
     float cz = cosf(-rot.z), sz = sinf(-rot.z);
     float x = p.x * cz - p.y * sz;
@@ -331,7 +336,6 @@ static inline xr_vec3_t sample_texture(xr_texture_t *tex, float u, float v) {
 }
 
 /* ========================== BVH ========================== */
-
 static mesh_t *g_sort_mesh = NULL;
 static int g_sort_axis = 0;
 
@@ -494,6 +498,9 @@ static bool intersect_bvh(mesh_t *mesh, xr_vec3_t orig, xr_vec3_t dir,
                 float t_tri; xr_vec3_t n_tri;
                 if (ray_triangle_intersect(orig, dir, v0, v1, v2, &t_tri, &n_tri)) {
                     if (t_tri > EPSILON && t_tri < t_min) {
+                        if (g_backface_culling_enabled && v_dot(n_tri, dir) >= 0.0f) {
+                            continue;   // backface
+                        }
                         t_min = t_tri;
                         *n_out = n_tri;
                         hit = true;
@@ -510,7 +517,6 @@ static bool intersect_bvh(mesh_t *mesh, xr_vec3_t orig, xr_vec3_t dir,
 }
 
 /* ========================== Scene intersection ========================== */
-
 static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_vec3_t *n_out,
                             bool *is_light, bool *is_glass, bool *is_edge, bool *is_table,
                             xr_material_t **out_mat, xr_texture_t **out_tex, float *out_u, float *out_v) {
@@ -526,67 +532,74 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
     float ymin = g_boundary[2], ymax = g_boundary[3];
     float zmin = g_boundary[4], zmax = g_boundary[5];
 
-    // Wall intersection (only if enabled)
     float t;
     if (g_wall_enabled[0] && dir.x > 1e-5f) {
         t = (xmax - origin.x) / dir.x;
         if (t > EPSILON && t < t_min) {
-            t_min = t; N = {-1,0,0};
-            hit = true;
-            mat_ptr = &g_wall_materials[0];
+            xr_vec3_t N_tmp = {-1,0,0};
+            if (!(g_backface_culling_enabled && v_dot(N_tmp, dir) >= 0.0f)) {
+                t_min = t; N = N_tmp; hit = true; mat_ptr = &g_wall_materials[0];
+            }
         }
     }
     if (g_wall_enabled[1] && dir.x < -1e-5f) {
         t = (xmin - origin.x) / dir.x;
         if (t > EPSILON && t < t_min) {
-            t_min = t; N = {1,0,0};
-            hit = true;
-            mat_ptr = &g_wall_materials[1];
+            xr_vec3_t N_tmp = {1,0,0};
+            if (!(g_backface_culling_enabled && v_dot(N_tmp, dir) >= 0.0f)) {
+                t_min = t; N = N_tmp; hit = true; mat_ptr = &g_wall_materials[1];
+            }
         }
     }
     if (g_wall_enabled[2] && dir.y > 1e-5f) {
         t = (ymax - origin.y) / dir.y;
         if (t > EPSILON && t < t_min) {
-            t_min = t; N = {0,-1,0};
-            xr_vec3_t P = v_add(origin, v_mul(dir, t));
-            float half = g_light_half_size;
-            float cx = g_light_center.x, cz = g_light_center.z;
-            *is_light = (P.x >= cx - half && P.x <= cx + half &&
-                         P.z >= cz - half && P.z <= cz + half);
-            hit = true;
-            mat_ptr = &g_wall_materials[2];
+            xr_vec3_t N_tmp = {0,-1,0};
+            if (!(g_backface_culling_enabled && v_dot(N_tmp, dir) >= 0.0f)) {
+                xr_vec3_t P = v_add(origin, v_mul(dir, t));
+                float half = g_light_half_size;
+                float cx = g_light_center.x, cz = g_light_center.z;
+                *is_light = (P.x >= cx - half && P.x <= cx + half &&
+                             P.z >= cz - half && P.z <= cz + half);
+                t_min = t; N = N_tmp; hit = true; mat_ptr = &g_wall_materials[2];
+            }
         }
     }
     if (g_wall_enabled[3] && dir.y < -1e-5f) {
         t = (ymin - origin.y) / dir.y;
         if (t > EPSILON && t < t_min) {
-            t_min = t; N = {0,1,0};
-            hit = true;
-            mat_ptr = &g_floor_material;
+            xr_vec3_t N_tmp = {0,1,0};
+            if (!(g_backface_culling_enabled && v_dot(N_tmp, dir) >= 0.0f)) {
+                t_min = t; N = N_tmp; hit = true; mat_ptr = &g_floor_material;
+            }
         }
     }
     if (g_wall_enabled[4] && dir.z > 1e-5f) {
         t = (zmax - origin.z) / dir.z;
         if (t > EPSILON && t < t_min) {
-            t_min = t; N = {0,0,-1};
-            hit = true;
-            mat_ptr = &g_wall_materials[4];
+            xr_vec3_t N_tmp = {0,0,-1};
+            if (!(g_backface_culling_enabled && v_dot(N_tmp, dir) >= 0.0f)) {
+                t_min = t; N = N_tmp; hit = true; mat_ptr = &g_wall_materials[4];
+            }
         }
     }
     if (g_wall_enabled[5] && dir.z < -1e-5f) {
         t = (zmin - origin.z) / dir.z;
         if (t > EPSILON && t < t_min) {
-            t_min = t; N = {0,0,1};
-            hit = true;
-            mat_ptr = &g_wall_materials[5];
+            xr_vec3_t N_tmp = {0,0,1};
+            if (!(g_backface_culling_enabled && v_dot(N_tmp, dir) >= 0.0f)) {
+                t_min = t; N = N_tmp; hit = true; mat_ptr = &g_wall_materials[5];
+            }
         }
     }
 
-    // Table AABBs
     for (int i = 0; i < g_table_aabb_count; i++) {
         float t_box; xr_vec3_t n_box;
         if (ray_aabb_intersect(origin, dir, g_table_aabbs[i], &t_box, &n_box)) {
             if (t_box < t_min) {
+                if (g_backface_culling_enabled && v_dot(n_box, dir) >= 0.0f) {
+                    continue;
+                }
                 t_min = t_box; N = n_box; hit = true;
                 *is_table = true;
                 *is_light = false; *is_glass = false; *is_edge = false;
@@ -595,7 +608,6 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
         }
     }
 
-    // User objects
     for (int i = 0; i < g_obj_count; i++) {
         scene_object_t *obj = &g_objects[i];
         switch (obj->type) {
@@ -620,13 +632,16 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                     }
                 }
                 if (t_near < t_far && t_near > EPSILON && t_near < t_min) {
-                    t_min = t_near; hit = true;
                     xr_vec3_t local_n = {0,0,0};
                     if (hit_axis == 0) local_n.x = hit_sign;
                     else if (hit_axis == 1) local_n.y = hit_sign;
                     else local_n.z = hit_sign;
                     N = apply_transform(local_n, (xr_vec3_t){0,0,0}, obj->rot, (xr_vec3_t){1,1,1});
                     N = v_norm(N);
+                    if (g_backface_culling_enabled && v_dot(N, dir) >= 0.0f) {
+                        break;
+                    }
+                    t_min = t_near; hit = true;
                     *is_light = false; *is_glass = false; *is_edge = false; *is_table = false;
                     mat_ptr = &obj->mat; tex_ptr = NULL;
                 }
@@ -660,10 +675,13 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                     }
                 }
                 if (t_near < t_far && t_near > EPSILON && t_near < t_min) {
-                    t_min = t_near; hit = true;
                     xr_vec3_t local_n = pyr_normals[hit_face];
                     N = apply_transform(local_n, (xr_vec3_t){0,0,0}, obj->rot, (xr_vec3_t){1,1,1});
                     N = v_norm(N);
+                    if (g_backface_culling_enabled && v_dot(N, dir) >= 0.0f) {
+                        break;
+                    }
+                    t_min = t_near; hit = true;
                     *is_light = false; *is_glass = false; *is_edge = false; *is_table = false;
                     mat_ptr = &obj->mat; tex_ptr = NULL;
                 }
@@ -683,8 +701,11 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                 float lx = v_dot(local, u_axis);
                 float ly = v_dot(local, v_axis);
                 if (fabsf(lx) <= obj->plane_width/2.0f && fabsf(ly) <= obj->plane_height/2.0f) {
-                    t_min = t_plane; hit = true;
                     N = plane_norm;
+                    if (g_backface_culling_enabled && v_dot(N, dir) >= 0.0f) {
+                        break;
+                    }
+                    t_min = t_plane; hit = true;
                     *is_light = false; *is_glass = false; *is_edge = false; *is_table = false;
                     mat_ptr = &obj->mat;
                     tex_ptr = &obj->texture;
@@ -699,6 +720,9 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                 float t_sph; xr_vec3_t n_sph;
                 if (ray_sphere_intersect(origin, dir, obj->center, obj->size, &t_sph, &n_sph)) {
                     if (t_sph > EPSILON && t_sph < t_min) {
+                        if (g_backface_culling_enabled && v_dot(n_sph, dir) >= 0.0f) {
+                            break;
+                        }
                         t_min = t_sph;
                         N = n_sph;
                         hit = true;
@@ -708,11 +732,50 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                 }
                 break;
             }
+            case OBJ_TRIANGLE: {
+                float t_tri; xr_vec3_t n_tri;
+                if (ray_triangle_intersect(origin, dir, obj->tri[0], obj->tri[1], obj->tri[2], &t_tri, &n_tri)) {
+                    if (t_tri > EPSILON && t_tri < t_min) {
+                        if (g_backface_culling_enabled && v_dot(n_tri, dir) >= 0.0f) {
+                            break;
+                        }
+                        t_min = t_tri;
+                        N = n_tri;
+                        hit = true;
+                        *is_light = false; *is_glass = false; *is_edge = false; *is_table = false;
+                        mat_ptr = &obj->mat; tex_ptr = NULL;
+                    }
+                }
+                break;
+            }
+            case OBJ_PLANE: {
+                xr_vec3_t plane_norm = v_norm(obj->plane_normal);
+                float denom = v_dot(plane_norm, dir);
+                if (fabsf(denom) < 1e-6f) break;
+                float t_plane = v_dot(v_sub(obj->center, origin), plane_norm) / denom;
+                if (t_plane < EPSILON || t_plane >= t_min) break;
+                xr_vec3_t P = v_add(origin, v_mul(dir, t_plane));
+                xr_vec3_t local = v_sub(P, obj->center);
+                xr_vec3_t ref = (fabsf(plane_norm.y) < 0.9f) ? (xr_vec3_t){0,1,0} : (xr_vec3_t){1,0,0};
+                xr_vec3_t u_axis = v_norm(v_cross(ref, plane_norm));
+                xr_vec3_t v_axis = v_cross(plane_norm, u_axis);
+                float lx = v_dot(local, u_axis);
+                float ly = v_dot(local, v_axis);
+                if (fabsf(lx) <= obj->plane_width/2.0f && fabsf(ly) <= obj->plane_height/2.0f) {
+                    N = plane_norm;
+                    if (g_backface_culling_enabled && v_dot(N, dir) >= 0.0f) {
+                        break;
+                    }
+                    t_min = t_plane; hit = true;
+                    *is_light = false; *is_glass = false; *is_edge = false; *is_table = false;
+                    mat_ptr = &obj->mat; tex_ptr = NULL;
+                }
+                break;
+            }
             default: break;
         }
     }
 
-    // Glass panels
     for (int i = 0; i < g_glass_count; i++) {
         glass_panel_t *panel = &g_glass_panels[i];
         for (int side = -1; side <= 1; side += 2) {
@@ -750,7 +813,6 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
         }
     }
 
-    // Meshes
     for (int i = 0; i < g_mesh_count; i++) {
         mesh_t *mesh = &g_meshes[i];
         if (g_bvh_enabled && mesh->bvh_root >= 0) {
@@ -775,6 +837,9 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                 float t_tri; xr_vec3_t n_tri;
                 if (ray_triangle_intersect(origin, dir, v0, v1, v2, &t_tri, &n_tri)) {
                     if (t_tri > EPSILON && t_tri < t_min) {
+                        if (g_backface_culling_enabled && v_dot(n_tri, dir) >= 0.0f) {
+                            continue;
+                        }
                         t_min = t_tri;
                         N = n_tri;
                         hit = true;
@@ -795,6 +860,7 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
     return hit;
 }
 
+/* ========================== Rendering ========================== */
 static void render_tile(int start_x, int start_y, int w, int h, uint16_t *tile_buf, uint16_t *framebuffer) {
     xr_vec3_t forward = v_norm(v_sub(g_cam_target, g_cam_pos));
     xr_vec3_t right = v_norm(v_cross(g_cam_up, forward));
@@ -853,11 +919,9 @@ static void render_tile(int start_x, int start_y, int w, int h, uint16_t *tile_b
                         ray_dir = new_dir;
                         continue;
                     } else {
-                        // ---- Diffuse + specular ----
                         xr_vec3_t L = v_norm(v_sub(g_light_pos, P));
                         float dist_to_light = sqrtf(v_dot(v_sub(g_light_pos, P), v_sub(g_light_pos, P)));
 
-                        // Compute shadow (common for all)
                         bool in_shadow = false;
                         if (g_shadow_enabled) {
                             xr_vec3_t shadow_origin = v_add(P, v_mul(normal, g_bias));
@@ -907,25 +971,18 @@ static void render_tile(int start_x, int start_y, int w, int h, uint16_t *tile_b
                             albedo.z = light_wood.z*wood + dark_wood.z*(1.0f-wood);
                             roughness = 0.3f;
                         } else if (tex) {
-                            // Textured plane: roughness controls transparency (alpha)
                             albedo = sample_texture(tex, uv_u, uv_v);
                             float alpha = mat ? fmaxf(0.0f, fminf(1.0f, mat->roughness)) : 1.0f;
                             if (alpha < 1.0f) {
-                                // Semi-transparent: compute only diffuse light, blend and continue ray
                                 float diff = fmaxf(v_dot(normal, L), 0.0f);
                                 float intensity = 0.2f + 0.6f * diff;
                                 if (in_shadow) intensity = 0.2f;
                                 xr_vec3_t light_color = v_mul(albedo, intensity);
-                                // Blend with current color
                                 color = v_add(v_mul(color, 1.0f - alpha), v_mul(light_color, alpha));
-                                // Continue ray through the plane
                                 ray_origin = v_add(P, v_mul(ray_dir, g_bias));
-                                // Keep ray_dir unchanged
-                                // Do not add reflection, just continue to next bounce
                                 continue;
                             } else {
-                                // Opaque: use albedo, no specular (matte)
-                                roughness = 1.0f; // no specular
+                                roughness = 1.0f;
                             }
                         } else if (mat) {
                             albedo = mat->albedo;
@@ -935,7 +992,6 @@ static void render_tile(int start_x, int start_y, int w, int h, uint16_t *tile_b
                             roughness = 0.8f;
                         }
 
-                        // Floor checkerboard override (only if not textured)
                         if (!tex && mat == &g_floor_material && g_floor_checker) {
                             float tile_size = 5.0f;
                             int ix = (int)floorf(P.x / tile_size);
@@ -944,7 +1000,6 @@ static void render_tile(int start_x, int start_y, int w, int h, uint16_t *tile_b
                             else albedo = (xr_vec3_t){0.8f,0.8f,0.8f};
                         }
 
-                        // Diffuse + specular (for opaque surfaces)
                         float intensity = 0.2f;
                         if (!in_shadow) {
                             intensity += 0.6f * fmaxf(v_dot(normal, L), 0.0f);
@@ -956,7 +1011,6 @@ static void render_tile(int start_x, int start_y, int w, int h, uint16_t *tile_b
                         }
                         color = v_add(color, v_mul(albedo, intensity * reflection_factor));
 
-                        // Reflect ray (with GGX microsurface if enabled)
                         xr_vec3_t new_dir = v_reflect(ray_dir, normal);
                         if (g_microsurface_enabled && roughness > 0.01f) {
                             float alpha = roughness * roughness;
@@ -995,7 +1049,6 @@ static void render_tile(int start_x, int start_y, int w, int h, uint16_t *tile_b
     }
 }
 
-/* ---------- Public render functions ---------- */
 void xr_render(uint16_t *framebuffer) {
     xr_render_region(0, 0, g_width, g_height, framebuffer);
 }
@@ -1003,14 +1056,12 @@ void xr_render(uint16_t *framebuffer) {
 void xr_render_region(int start_x, int start_y, int w, int h, uint16_t *framebuffer) {
     if (!framebuffer) return;
 
-    // 裁剪区域
     if (start_x < 0) { w += start_x; start_x = 0; }
     if (start_y < 0) { h += start_y; start_y = 0; }
     if (start_x + w > g_width) w = g_width - start_x;
     if (start_y + h > g_height) h = g_height - start_y;
     if (w <= 0 || h <= 0) return;
 
-    // 如果启用 BVH，构建/使用 BVH
     if (g_bvh_enabled) {
         for (int i = 0; i < g_mesh_count; i++) {
             mesh_t *mesh = &g_meshes[i];
@@ -1020,25 +1071,20 @@ void xr_render_region(int start_x, int start_y, int w, int h, uint16_t *framebuf
         }
     }
 
-    // 获取用户提供的 tile buffer 和尺寸
     uint16_t *tile_buf = g_tile_buffer;
     int tile_w = g_tile_buffer_size;
     int tile_h = g_tile_buffer_size;
 
-    // 如果未提供 buffer 或块尺寸无效或块太大（≥区域宽或高），直接渲染整个区域（无分块）
     if (tile_buf == NULL || tile_w <= 0 || tile_w >= w || tile_h >= h) {
         render_tile(start_x, start_y, w, h, framebuffer + start_y * g_width + start_x, framebuffer);
         return;
     }
 
-    // 分块渲染
     for (int ty = start_y; ty < start_y + h; ty += tile_h) {
         int cur_h = (ty + tile_h > start_y + h) ? (start_y + h - ty) : tile_h;
         for (int tx = start_x; tx < start_x + w; tx += tile_w) {
             int cur_w = (tx + tile_w > start_x + w) ? (start_x + w - tx) : tile_w;
-            // 渲染当前块到 tile_buf（实际使用区域 cur_w x cur_h）
             render_tile(tx, ty, cur_w, cur_h, tile_buf, framebuffer);
-            // 将 tile_buf 中有效数据复制到 framebuffer
             for (int y = 0; y < cur_h; y++) {
                 memcpy(framebuffer + (ty + y) * g_width + tx,
                        tile_buf + y * tile_w,
@@ -1067,6 +1113,9 @@ void xr_init(int width, int height, int max_bounces, int aa_samples) {
         }
         free(g_meshes);
     }
+    for (int i = 0; i < g_lock_group_count; i++) free(g_lock_groups[i].indices);
+    free(g_lock_groups);
+
     g_objects = NULL;
     g_obj_count = 0;
     g_obj_capacity = 0;
@@ -1077,8 +1126,9 @@ void xr_init(int width, int height, int max_bounces, int aa_samples) {
     g_meshes = NULL;
     g_mesh_count = 0;
     g_mesh_capacity = 0;
+    g_lock_groups = NULL;
+    g_lock_group_count = 0;
 
-    /* Reset boundary */
     g_boundary[0] = -50.0f; g_boundary[1] = 50.0f;
     g_boundary[2] = -50.0f; g_boundary[3] = 50.0f;
     g_boundary[4] = -50.0f; g_boundary[5] = 50.0f;
@@ -1101,9 +1151,9 @@ void xr_init(int width, int height, int max_bounces, int aa_samples) {
     g_shadow_enabled = false;
     g_microsurface_enabled = false;
     g_bvh_enabled = false;
+    g_backface_culling_enabled = false;
 }
 
-/* ---------- Scene editing API ---------- */
 void xr_set_boundary(float xmin, float xmax, float ymin, float ymax, float zmin, float zmax) {
     g_boundary[0] = xmin;
     g_boundary[1] = xmax;
@@ -1136,9 +1186,9 @@ void xr_set_light_region(xr_vec3_t center, float half_size) {
     g_light_half_size = half_size;
 }
 
-/* ---------- Standard setters ---------- */
-void xr_set_tile_size(int size) {
-    g_tile_size = (size > 0) ? size : 0;
+void xr_set_tile_buffer(uint16_t* buffer, int size) {
+    g_tile_buffer = buffer;
+    g_tile_buffer_size = size;
 }
 
 void xr_set_camera(xr_vec3_t pos, xr_vec3_t target, xr_vec3_t up) {
@@ -1161,9 +1211,7 @@ void xr_enable_microsurface(bool enable) { g_microsurface_enabled = enable; }
 
 void xr_enable_bvh(bool enable) {
     g_bvh_enabled = enable;
-    if (enable) {
-        printf("BVH enabled.\n");
-    } else {
+    if (!enable) {
         for (int i = 0; i < g_mesh_count; i++) {
             mesh_t *mesh = &g_meshes[i];
             if (mesh->bvh_nodes) {
@@ -1175,6 +1223,10 @@ void xr_enable_bvh(bool enable) {
             }
         }
     }
+}
+
+void xr_enable_backface_culling(bool enable) {
+    g_backface_culling_enabled = enable;
 }
 
 xr_vec3_t xr_conv_angle_to_normal(float ax, float ay, float az) {
@@ -1206,24 +1258,23 @@ static void ensure_object_capacity(int extra) {
     }
 }
 
-/* ---------- Add functions (backward-compatible with 4 args) ---------- */
 int xr_add_cube(xr_vec3_t center, float size, float angle_rad, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_CUBE, mat, center, size, {0, angle_rad, 0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false };
+    scene_object_t obj = { OBJ_CUBE, mat, center, size, {0, angle_rad, 0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
 }
 
 int xr_add_pyramid(xr_vec3_t center, float size, float angle_rad, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_PYRAMID, mat, center, size, {0, angle_rad, 0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false };
+    scene_object_t obj = { OBJ_PYRAMID, mat, center, size, {0, angle_rad, 0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
 }
 
 int xr_add_sphere(xr_vec3_t center, float radius, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_SPHERE, mat, center, radius, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false };
+    scene_object_t obj = { OBJ_SPHERE, mat, center, radius, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
 }
@@ -1272,7 +1323,7 @@ int xr_add_glass_panel(xr_vec3_t center, xr_vec3_t normal, float half_width, flo
 int xr_add_textured_plane(xr_vec3_t center, xr_vec3_t normal, float width, float height,
                            xr_texture_t tex, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_TEXTURED_PLANE, mat, center, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, v_norm(normal), width, height, tex, false, false };
+    scene_object_t obj = { OBJ_TEXTURED_PLANE, mat, center, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, v_norm(normal), width, height, tex, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
 }
@@ -1311,25 +1362,82 @@ int xr_add_mesh(const xr_vec3_t* vertices, const uint16_t* indices,
     return -1;
 }
 
-/* ---------- 3-axis rotation ---------- */
-void xr_rotate_element(int idx, float rx, float ry, float rz) {
-    if (idx < 0 || idx >= g_obj_count) return;
-    scene_object_t *obj = &g_objects[idx];
+int xr_add_triangle(xr_vec3_t v0, xr_vec3_t v1, xr_vec3_t v2, xr_material_t mat) {
+    ensure_object_capacity(1);
+    scene_object_t obj = { OBJ_TRIANGLE, mat, {0,0,0}, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {v0, v1, v2} };
+    g_objects[g_obj_count] = obj;
+    return g_obj_count++;
+}
+
+int xr_add_plane(xr_vec3_t center, xr_vec3_t normal, float width, float height, xr_material_t mat) {
+    ensure_object_capacity(1);
+    scene_object_t obj = { OBJ_PLANE, mat, center, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, v_norm(normal), width, height, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
+    g_objects[g_obj_count] = obj;
+    return g_obj_count++;
+}
+
+int xr_lock_by_index(int first, ...) {
+    if (first < 0) return -1;
+    va_list args;
+    va_start(args, first);
+    int count = 0;
+    int idx = first;
+    while (idx >= 0) {
+        count++;
+        idx = va_arg(args, int);
+    }
+    va_end(args);
+
+    if (count == 0) return -1;
+
+    int group_id = g_lock_group_count++;
+    g_lock_groups = (lock_group_t*)realloc(g_lock_groups, sizeof(lock_group_t) * g_lock_group_count);
+    lock_group_t *group = &g_lock_groups[group_id];
+    group->count = count;
+    group->capacity = count;
+    group->indices = (int*)malloc(sizeof(int) * count);
+
+    va_start(args, first);
+    idx = first;
+    for (int i = 0; i < count; i++) {
+        group->indices[i] = idx;
+        idx = va_arg(args, int);
+    }
+    va_end(args);
+
+    return group_id;
+}
+
+static void rotate_single_object(scene_object_t *obj, float rx, float ry, float rz) {
     obj->rot.x += rx;
     obj->rot.y += ry;
     obj->rot.z += rz;
 }
 
-/* ---------- Texture flip ---------- */
+void xr_rotate_element(int idx, float rx, float ry, float rz) {
+    for (int g = 0; g < g_lock_group_count; g++) {
+        lock_group_t *group = &g_lock_groups[g];
+        for (int i = 0; i < group->count; i++) {
+            if (group->indices[i] == idx) {
+                for (int j = 0; j < group->count; j++) {
+                    int obj_idx = group->indices[j];
+                    if (obj_idx >= 0 && obj_idx < g_obj_count) {
+                        rotate_single_object(&g_objects[obj_idx], rx, ry, rz);
+                    }
+                }
+                return;
+            }
+        }
+    }
+    if (idx >= 0 && idx < g_obj_count) {
+        rotate_single_object(&g_objects[idx], rx, ry, rz);
+    }
+}
+
 void xr_set_texture_flip(int idx, bool flip_h, bool flip_v) {
     if (idx < 0 || idx >= g_obj_count) return;
     scene_object_t *obj = &g_objects[idx];
     if (obj->type != OBJ_TEXTURED_PLANE) return;
     obj->tex_flip_h = flip_h;
     obj->tex_flip_v = flip_v;
-}
-
-void xr_set_tile_buffer(uint16_t* buffer, int size) {
-    g_tile_buffer = buffer;
-    g_tile_buffer_size = size;
 }
