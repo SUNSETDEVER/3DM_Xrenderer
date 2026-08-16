@@ -150,7 +150,7 @@ void xr_enable_microsurface(bool enable);
 void xr_enable_bvh(bool enable);
 
 /**
- * @brief 启用/禁用背面剔除（默认启用）。
+ * @brief 启用/禁用背面剔除（默认禁用）。
  * @brief Enables/disables backface culling (enabled by default).
  * @param enable true 剔除朝向光线的三角形背面，false 则双面渲染
  *               true to cull triangles facing the ray, false for double-sided rendering
