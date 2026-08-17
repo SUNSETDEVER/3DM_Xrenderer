@@ -86,7 +86,7 @@ Predefined materials (can be used directly):
 - `xr_mat_chrome`, `xr_mat_brass`
 
 Custom material helper:
-```c
+```cpp
 xr_material_t my_mat = xr_material_make((xr_vec3_t){0.2, 0.8, 0.3}, 0.4f);
 xr\_material\_t my\_mat = xr\_material\_make((xr\_vec3\_t){0.2, 0.8, 0.3}, 0.4f);
 ```
@@ -95,7 +95,7 @@ xr\_material\_t my\_mat = xr\_material\_make((xr\_vec3\_t){0.2, 0.8, 0.3}, 0.4f)
 Tile‑Based Rendering
 To reduce SPIRAM pressure, the library supports external tile buffers:
 
-```c
+```cpp
 #define TILE_SIZE 32
 static uint16_t tile_buffer[TILE_SIZE * TILE_SIZE];
 xr_set_tile_buffer(tile_buffer, TILE_SIZE);
@@ -118,7 +118,7 @@ If no buffer is provided, the library renders directly (no tiling). The tile buf
 ---
 
 **Quick Start**
-```c
+```cpp
 #include "3DM_Xrenderer.h"
 
 #define W 320
@@ -148,7 +148,7 @@ void loop{
 
 ---
 
--Standard **C** library
+-Standard **Cpp** library
 
 -**Arduino** framework (or bare‑metal with printf for warnings)
 
