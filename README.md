@@ -148,7 +148,7 @@ void loop{
 
 ---
 
--Standard **Cpp** library
+-Standard **C** library
 
 -**Arduino** framework (or bare‑metal with printf for warnings)
 
