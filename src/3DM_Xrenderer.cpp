@@ -1,5 +1,5 @@
 ﻿/**
- * @file 3DM_Xrenderer.c
+ * @file 3DM_Xrenderer.cpp
  * @brief Implementation of 3DM_Xrenderer library.
  * @version 1.3  (Added mesh texture support with UV interpolation)
  */
