@@ -1,6 +1,7 @@
-/**
+﻿/**
  * @file 3DM_Xrenderer.cpp
  * @brief Implementation of 3DM_Xrenderer library.
+ * @version 1.3  (Added mesh texture support with UV interpolation)
  */
 
 #include "3DM_Xrenderer.h"
@@ -73,6 +74,7 @@ typedef struct {
     bool tex_flip_h;
     bool tex_flip_v;
     xr_vec3_t tri[3];
+    float tex_rotation;
 } scene_object_t;
 
 typedef struct bvh_node_t {
@@ -86,10 +88,12 @@ typedef struct bvh_node_t {
 
 typedef struct {
     xr_vec3_t *vertices;
+    xr_vec3_t *uvs;          // 顶点 UV 坐标 (u,v,0)
     uint16_t *indices;
     int num_vertices;
     int num_triangles;
     xr_material_t mat;
+    xr_texture_t texture;    // 网格纹理（可为空）
     bvh_node_t *bvh_nodes;
     int bvh_root;
     int bvh_node_count;
@@ -244,6 +248,52 @@ static inline uint32_t splitmix32(uint32_t *state) {
     return z ^ (z >> 16);
 }
 
+/* ---------- 3x3 Matrix helpers ---------- */
+static inline void mat3_identity(float m[3][3]) {
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) m[i][j] = (i == j) ? 1.0f : 0.0f;
+}
+
+static inline void mat3_mul(float a[3][3], float b[3][3], float out[3][3]) {
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            out[i][j] = a[i][0]*b[0][j] + a[i][1]*b[1][j] + a[i][2]*b[2][j];
+        }
+    }
+}
+
+static inline void mat3_from_euler(float rx, float ry, float rz, float m[3][3]) {
+    float cx = cosf(rx), sx = sinf(rx);
+    float cy = cosf(ry), sy = sinf(ry);
+    float cz = cosf(rz), sz = sinf(rz);
+    // Rotation order: ZYX (m = Rz * Ry * Rx)
+    m[0][0] = cy*cz;                     m[0][1] = sx*sy*cz - cx*sz;  m[0][2] = cx*sy*cz + sx*sz;
+    m[1][0] = cy*sz;                     m[1][1] = sx*sy*sz + cx*cz;  m[1][2] = cx*sy*sz - sx*cz;
+    m[2][0] = -sy;                       m[2][1] = sx*cy;             m[2][2] = cx*cy;
+}
+
+static inline void mat3_axis_angle(float ax, float ay, float az, float angle, float m[3][3]) {
+    float len = sqrtf(ax*ax + ay*ay + az*az);
+    if (len < 1e-6f) { mat3_identity(m); return; }
+    float x = ax / len, y = ay / len, z = az / len;
+    float c = cosf(angle), s = sinf(angle), t = 1.0f - c;
+    m[0][0] = t*x*x + c;       m[0][1] = t*x*y - s*z;   m[0][2] = t*x*z + s*y;
+    m[1][0] = t*x*y + s*z;     m[1][1] = t*y*y + c;     m[1][2] = t*y*z - s*x;
+    m[2][0] = t*x*z - s*y;     m[2][1] = t*y*z + s*x;   m[2][2] = t*z*z + c;
+}
+
+static inline void euler_from_mat3(float m[3][3], float *rx, float *ry, float *rz) {
+    *ry = asinf(-m[2][0]);
+    float cos_y = cosf(*ry);
+    if (fabsf(cos_y) > 1e-6f) {
+        *rx = atan2f(m[2][1], m[2][2]);
+        *rz = atan2f(m[1][0], m[0][0]);
+    } else {
+        // Gimbal lock: set rx = 0, rz = atan2(-m[0][1], m[1][1])
+        *rx = 0.0f;
+        *rz = atan2f(-m[0][1], m[1][1]);
+    }
+}
+
 /* ---------- Intersection helpers ---------- */
 static inline bool ray_aabb_intersect(xr_vec3_t origin, xr_vec3_t dir, aabb_t box, float *t_out, xr_vec3_t *n_out) {
     float t_min = -1e9f, t_max = 1e9f;
@@ -278,9 +328,11 @@ static inline bool ray_aabb_intersect(xr_vec3_t origin, xr_vec3_t dir, aabb_t bo
     return false;
 }
 
+// 修改 ray_triangle_intersect 以输出重心坐标 u, v
 static inline bool ray_triangle_intersect(xr_vec3_t orig, xr_vec3_t dir,
                                           xr_vec3_t v0, xr_vec3_t v1, xr_vec3_t v2,
-                                          float *t_out, xr_vec3_t *n_out) {
+                                          float *t_out, xr_vec3_t *n_out,
+                                          float *out_u, float *out_v) {
     const float EPS_TRI = 1e-6f;
     xr_vec3_t edge1 = v_sub(v1, v0);
     xr_vec3_t edge2 = v_sub(v2, v0);
@@ -298,6 +350,8 @@ static inline bool ray_triangle_intersect(xr_vec3_t orig, xr_vec3_t dir,
     if (t > EPSILON) {
         *t_out = t;
         *n_out = v_norm(v_cross(edge1, edge2));
+        if (out_u) *out_u = u;
+        if (out_v) *out_v = v;
         return true;
     }
     return false;
@@ -470,7 +524,8 @@ static void build_mesh_bvh(mesh_t *mesh) {
 }
 
 static bool intersect_bvh(mesh_t *mesh, xr_vec3_t orig, xr_vec3_t dir,
-                          float *t_out, xr_vec3_t *n_out) {
+                          float *t_out, xr_vec3_t *n_out,
+                          float *out_u, float *out_v) {
     if (mesh->bvh_root < 0) return false;
     #define STACK_SIZE 64
     int stack[STACK_SIZE];
@@ -478,6 +533,7 @@ static bool intersect_bvh(mesh_t *mesh, xr_vec3_t orig, xr_vec3_t dir,
     stack[top++] = mesh->bvh_root;
     float t_min = 1e9f;
     bool hit = false;
+    float best_u = 0.0f, best_v = 0.0f;
 
     while (top > 0) {
         int node_idx = stack[--top];
@@ -496,13 +552,16 @@ static bool intersect_bvh(mesh_t *mesh, xr_vec3_t orig, xr_vec3_t dir,
                 xr_vec3_t v1 = mesh->vertices[idx[1]];
                 xr_vec3_t v2 = mesh->vertices[idx[2]];
                 float t_tri; xr_vec3_t n_tri;
-                if (ray_triangle_intersect(orig, dir, v0, v1, v2, &t_tri, &n_tri)) {
+                float u, v;
+                if (ray_triangle_intersect(orig, dir, v0, v1, v2, &t_tri, &n_tri, &u, &v)) {
                     if (t_tri > EPSILON && t_tri < t_min) {
                         if (g_backface_culling_enabled && v_dot(n_tri, dir) >= 0.0f) {
-                            continue;   // backface
+                            continue;
                         }
                         t_min = t_tri;
                         *n_out = n_tri;
+                        best_u = u;
+                        best_v = v;
                         hit = true;
                     }
                 }
@@ -512,7 +571,11 @@ static bool intersect_bvh(mesh_t *mesh, xr_vec3_t orig, xr_vec3_t dir,
             stack[top++] = node->left;
         }
     }
-    if (hit) *t_out = t_min;
+    if (hit) {
+        *t_out = t_min;
+        if (out_u) *out_u = best_u;
+        if (out_v) *out_v = best_v;
+    }
     return hit;
 }
 
@@ -688,7 +751,8 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                 break;
             }
             case OBJ_TEXTURED_PLANE: {
-                xr_vec3_t plane_norm = v_norm(obj->plane_normal);
+                xr_vec3_t plane_norm = apply_transform(obj->plane_normal, (xr_vec3_t){0,0,0}, obj->rot, (xr_vec3_t){1,1,1});
+                plane_norm = v_norm(plane_norm);
                 float denom = v_dot(plane_norm, dir);
                 if (fabsf(denom) < 1e-6f) break;
                 float t_plane = v_dot(v_sub(obj->center, origin), plane_norm) / denom;
@@ -711,6 +775,23 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                     tex_ptr = &obj->texture;
                     u_uv = (lx / obj->plane_width) + 0.5f;
                     v_uv = (ly / obj->plane_height) + 0.5f;
+
+                    // Texture UV rotation with aspect-ratio correction
+                    if (obj->tex_rotation != 0.0f && tex_ptr != NULL && tex_ptr->data != NULL) {
+                        float aspect = (float)tex_ptr->width / (float)tex_ptr->height;
+                        if (aspect > 0.0f) {
+                            float u_cent = u_uv - 0.5f;
+                            float v_cent = v_uv - 0.5f;
+                            u_cent *= aspect;
+                            float cosA = cosf(obj->tex_rotation);
+                            float sinA = sinf(obj->tex_rotation);
+                            float u_rot = u_cent * cosA - v_cent * sinA;
+                            float v_rot = u_cent * sinA + v_cent * cosA;
+                            u_rot /= aspect;
+                            u_uv = u_rot + 0.5f;
+                            v_uv = v_rot + 0.5f;
+                        }
+                    }
                     if (obj->tex_flip_h) u_uv = 1.0f - u_uv;
                     if (obj->tex_flip_v) v_uv = 1.0f - v_uv;
                 }
@@ -734,7 +815,7 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
             }
             case OBJ_TRIANGLE: {
                 float t_tri; xr_vec3_t n_tri;
-                if (ray_triangle_intersect(origin, dir, obj->tri[0], obj->tri[1], obj->tri[2], &t_tri, &n_tri)) {
+                if (ray_triangle_intersect(origin, dir, obj->tri[0], obj->tri[1], obj->tri[2], &t_tri, &n_tri, NULL, NULL)) {
                     if (t_tri > EPSILON && t_tri < t_min) {
                         if (g_backface_culling_enabled && v_dot(n_tri, dir) >= 0.0f) {
                             break;
@@ -749,7 +830,8 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                 break;
             }
             case OBJ_PLANE: {
-                xr_vec3_t plane_norm = v_norm(obj->plane_normal);
+                xr_vec3_t plane_norm = apply_transform(obj->plane_normal, (xr_vec3_t){0,0,0}, obj->rot, (xr_vec3_t){1,1,1});
+                plane_norm = v_norm(plane_norm);
                 float denom = v_dot(plane_norm, dir);
                 if (fabsf(denom) < 1e-6f) break;
                 float t_plane = v_dot(v_sub(obj->center, origin), plane_norm) / denom;
@@ -813,17 +895,27 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
         }
     }
 
+    // 遍历网格
     for (int i = 0; i < g_mesh_count; i++) {
         mesh_t *mesh = &g_meshes[i];
         if (g_bvh_enabled && mesh->bvh_root >= 0) {
             float t_tri; xr_vec3_t n_tri;
-            if (intersect_bvh(mesh, origin, dir, &t_tri, &n_tri)) {
+            float u, v;
+            if (intersect_bvh(mesh, origin, dir, &t_tri, &n_tri, &u, &v)) {
                 if (t_tri > EPSILON && t_tri < t_min) {
                     t_min = t_tri;
                     N = n_tri;
                     hit = true;
                     *is_light = false; *is_glass = false; *is_edge = false; *is_table = false;
-                    mat_ptr = &mesh->mat; tex_ptr = NULL;
+                    mat_ptr = &mesh->mat;
+                    // 处理纹理
+                    if (mesh->texture.data != NULL) {
+                        tex_ptr = &mesh->texture;
+                        u_uv = u;
+                        v_uv = v;
+                    } else {
+                        tex_ptr = NULL;
+                    }
                 }
             }
         } else {
@@ -835,7 +927,8 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                 xr_vec3_t v1 = mesh->vertices[i1];
                 xr_vec3_t v2 = mesh->vertices[i2];
                 float t_tri; xr_vec3_t n_tri;
-                if (ray_triangle_intersect(origin, dir, v0, v1, v2, &t_tri, &n_tri)) {
+                float u, v;
+                if (ray_triangle_intersect(origin, dir, v0, v1, v2, &t_tri, &n_tri, &u, &v)) {
                     if (t_tri > EPSILON && t_tri < t_min) {
                         if (g_backface_culling_enabled && v_dot(n_tri, dir) >= 0.0f) {
                             continue;
@@ -844,7 +937,14 @@ static bool scene_intersect(xr_vec3_t origin, xr_vec3_t dir, float *t_out, xr_ve
                         N = n_tri;
                         hit = true;
                         *is_light = false; *is_glass = false; *is_edge = false; *is_table = false;
-                        mat_ptr = &mesh->mat; tex_ptr = NULL;
+                        mat_ptr = &mesh->mat;
+                        if (mesh->texture.data != NULL) {
+                            tex_ptr = &mesh->texture;
+                            u_uv = u;
+                            v_uv = v;
+                        } else {
+                            tex_ptr = NULL;
+                        }
                     }
                 }
             }
@@ -1108,6 +1208,7 @@ void xr_init(int width, int height, int max_bounces, int aa_samples) {
     if (g_meshes) {
         for (int i = 0; i < g_mesh_count; i++) {
             free(g_meshes[i].vertices);
+            free(g_meshes[i].uvs);
             free(g_meshes[i].indices);
             if (g_meshes[i].bvh_nodes) free(g_meshes[i].bvh_nodes);
         }
@@ -1260,21 +1361,21 @@ static void ensure_object_capacity(int extra) {
 
 int xr_add_cube(xr_vec3_t center, float size, float angle_rad, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_CUBE, mat, center, size, {0, angle_rad, 0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
+    scene_object_t obj = { OBJ_CUBE, mat, center, size, {0, angle_rad, 0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}}, 0.0f };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
 }
 
 int xr_add_pyramid(xr_vec3_t center, float size, float angle_rad, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_PYRAMID, mat, center, size, {0, angle_rad, 0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
+    scene_object_t obj = { OBJ_PYRAMID, mat, center, size, {0, angle_rad, 0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}}, 0.0f };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
 }
 
 int xr_add_sphere(xr_vec3_t center, float radius, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_SPHERE, mat, center, radius, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
+    scene_object_t obj = { OBJ_SPHERE, mat, center, radius, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}}, 0.0f };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
 }
@@ -1323,15 +1424,16 @@ int xr_add_glass_panel(xr_vec3_t center, xr_vec3_t normal, float half_width, flo
 int xr_add_textured_plane(xr_vec3_t center, xr_vec3_t normal, float width, float height,
                            xr_texture_t tex, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_TEXTURED_PLANE, mat, center, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, v_norm(normal), width, height, tex, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
+    scene_object_t obj = { OBJ_TEXTURED_PLANE, mat, center, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, v_norm(normal), width, height, tex, false, false, {{0,0,0},{0,0,0},{0,0,0}}, 0.0f };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
 }
 
-int xr_add_mesh(const xr_vec3_t* vertices, const uint16_t* indices,
+// 修改后的 xr_add_mesh 支持 UV 和纹理
+int xr_add_mesh(const xr_vec3_t* vertices, const xr_vec3_t* uvs, const uint16_t* indices,
                  int num_vertices, int num_triangles,
                  xr_vec3_t position, xr_vec3_t rotation_euler, xr_vec3_t scale,
-                 xr_material_t mat) {
+                 xr_material_t mat, xr_texture_t tex) {
     if (g_mesh_count >= g_mesh_capacity) {
         int new_cap = g_mesh_capacity * 2 + 4;
         mesh_t *new_meshes = (mesh_t*)realloc(g_meshes, sizeof(mesh_t) * new_cap);
@@ -1343,6 +1445,7 @@ int xr_add_mesh(const xr_vec3_t* vertices, const uint16_t* indices,
     mesh->num_vertices = num_vertices;
     mesh->num_triangles = num_triangles;
     mesh->mat = mat;
+    mesh->texture = tex;
     mesh->bvh_nodes = NULL;
     mesh->bvh_root = -1;
     mesh->bvh_node_count = 0;
@@ -1350,30 +1453,46 @@ int xr_add_mesh(const xr_vec3_t* vertices, const uint16_t* indices,
 
     mesh->vertices = (xr_vec3_t*)malloc(sizeof(xr_vec3_t) * num_vertices);
     mesh->indices = (uint16_t*)malloc(sizeof(uint16_t) * num_triangles * 3);
-    if (!mesh->vertices || !mesh->indices) {
-        free(mesh->vertices); free(mesh->indices);
+    if (uvs) {
+        mesh->uvs = (xr_vec3_t*)malloc(sizeof(xr_vec3_t) * num_vertices);
+    } else {
+        mesh->uvs = NULL;
+    }
+    if (!mesh->vertices || !mesh->indices || (uvs && !mesh->uvs)) {
+        free(mesh->vertices); free(mesh->indices); free(mesh->uvs);
         g_mesh_count--;
         return -1;
     }
     memcpy(mesh->indices, indices, sizeof(uint16_t) * num_triangles * 3);
     for (int i = 0; i < num_vertices; i++) {
         mesh->vertices[i] = apply_transform(vertices[i], position, rotation_euler, scale);
+        if (uvs) {
+            mesh->uvs[i] = uvs[i]; // 只复制 u,v，忽略 z
+        }
     }
     return -1;
 }
 
 int xr_add_triangle(xr_vec3_t v0, xr_vec3_t v1, xr_vec3_t v2, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_TRIANGLE, mat, {0,0,0}, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {v0, v1, v2} };
+    scene_object_t obj = { OBJ_TRIANGLE, mat, {0,0,0}, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, {0,0,0}, 0,0, {NULL,0,0}, false, false, {v0, v1, v2}, 0.0f };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
 }
 
 int xr_add_plane(xr_vec3_t center, xr_vec3_t normal, float width, float height, xr_material_t mat) {
     ensure_object_capacity(1);
-    scene_object_t obj = { OBJ_PLANE, mat, center, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, v_norm(normal), width, height, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}} };
+    scene_object_t obj = { OBJ_PLANE, mat, center, 0, {0,0,0}, 0,0,0,0, {0,0,0},0,0,0,0, v_norm(normal), width, height, {NULL,0,0}, false, false, {{0,0,0},{0,0,0},{0,0,0}}, 0.0f };
     g_objects[g_obj_count] = obj;
     return g_obj_count++;
+}
+
+/* ---------- Texture rotation API ---------- */
+void xr_set_texture_rotation(int idx, float angle) {
+    if (idx < 0 || idx >= g_obj_count) return;
+    scene_object_t *obj = &g_objects[idx];
+    if (obj->type != OBJ_TEXTURED_PLANE) return;
+    obj->tex_rotation = angle;
 }
 
 int xr_lock_by_index(int first, ...) {
@@ -1440,4 +1559,62 @@ void xr_set_texture_flip(int idx, bool flip_h, bool flip_v) {
     if (obj->type != OBJ_TEXTURED_PLANE) return;
     obj->tex_flip_h = flip_h;
     obj->tex_flip_v = flip_v;
+}
+
+/* ---------- Rotate around arbitrary fixed axis ---------- */
+void xr_rotate_axis(int idx, xr_vec3_t p1, xr_vec3_t p2, float arc) {
+    xr_vec3_t d = v_sub(p2, p1);
+    float len = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+    if (len < 1e-6f || fabsf(arc) < 1e-6f) return;
+    d.x /= len; d.y /= len; d.z /= len;
+    xr_vec3_t A = p1;
+
+    float R_axis[3][3];
+    mat3_axis_angle(d.x, d.y, d.z, arc, R_axis);
+
+    int targets[256];
+    int target_count = 0;
+    bool in_group = false;
+    for (int g = 0; g < g_lock_group_count; g++) {
+        lock_group_t *group = &g_lock_groups[g];
+        for (int i = 0; i < group->count; i++) {
+            if (group->indices[i] == idx) {
+                for (int j = 0; j < group->count; j++) {
+                    int obj_idx = group->indices[j];
+                    if (obj_idx >= 0 && obj_idx < g_obj_count) {
+                        targets[target_count++] = obj_idx;
+                    }
+                }
+                in_group = true;
+                break;
+            }
+        }
+        if (in_group) break;
+    }
+    if (!in_group) {
+        if (idx >= 0 && idx < g_obj_count) {
+            targets[target_count++] = idx;
+        }
+    }
+
+    for (int t = 0; t < target_count; t++) {
+        scene_object_t *obj = &g_objects[targets[t]];
+
+        xr_vec3_t rel = v_sub(obj->center, A);
+        xr_vec3_t rel_rot;
+        rel_rot.x = R_axis[0][0]*rel.x + R_axis[0][1]*rel.y + R_axis[0][2]*rel.z;
+        rel_rot.y = R_axis[1][0]*rel.x + R_axis[1][1]*rel.y + R_axis[1][2]*rel.z;
+        rel_rot.z = R_axis[2][0]*rel.x + R_axis[2][1]*rel.y + R_axis[2][2]*rel.z;
+        obj->center = v_add(A, rel_rot);
+
+        float R_old[3][3];
+        mat3_from_euler(obj->rot.x, obj->rot.y, obj->rot.z, R_old);
+        float R_new[3][3];
+        mat3_mul(R_axis, R_old, R_new);
+        float rx, ry, rz;
+        euler_from_mat3(R_new, &rx, &ry, &rz);
+        obj->rot.x = rx;
+        obj->rot.y = ry;
+        obj->rot.z = rz;
+    }
 }
